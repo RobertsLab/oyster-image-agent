@@ -1,0 +1,13 @@
+{
+  "px_per_mm": 2.43544029113622,
+  "mm_per_px": 0.41060337370597755,
+  "board_roi_xyxy": [
+    0.0,
+    482.5,
+    3806.1669921875,
+    2232.5
+  ],
+  "source_image": "20260522_bag380_raw.jpeg",
+  "n_calibration_oysters": 72,
+  "method": "least-squares through origin over pooled length+width vs human mm"
+}
