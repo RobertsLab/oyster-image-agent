@@ -43,13 +43,17 @@ def ensure_weights(path: str) -> str:
 
 
 def segment_everything(image_bgr, weights, imgsz=1024, conf=0.4, iou=0.9,
-                       device="cpu"):
-    """Run FastSAM in 'segment everything' mode. Returns an (N, H, W) uint8 array."""
+                       device="cpu", max_det=300):
+    """Run FastSAM in 'segment everything' mode. Returns an (N, H, W) uint8 array.
+
+    ``max_det`` is FastSAM's proposal cap. The default of 300 silently truncates
+    dense seed/spat photos, so raise it when a tray holds more than ~300 objects.
+    """
     from ultralytics import FastSAM
 
     model = FastSAM(weights)
     res = model(image_bgr, device=device, retina_masks=True, imgsz=imgsz,
-                conf=conf, iou=iou, verbose=False)[0]
+                conf=conf, iou=iou, verbose=False, max_det=max_det)[0]
     if res.masks is None:
         return np.zeros((0,) + image_bgr.shape[:2], np.uint8)
     return res.masks.data.cpu().numpy().astype(np.uint8)
@@ -125,6 +129,37 @@ def _mask_iou(a, b):
     return inter / union if union else 0.0
 
 
+def _bbox(mask):
+    ys, xs = np.nonzero(mask)
+    if xs.size == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def _mask_iou_fast(a, b, ba, bb):
+    """IoU of two full-frame masks, evaluated only where their boxes overlap.
+
+    A plain ``_mask_iou`` compares every pixel of two full-resolution frames,
+    so an O(n^2) NMS over a few hundred masks becomes untenable once
+    ``max_det`` is raised. Disjoint boxes are 0 by construction, and
+    overlapping ones only need the intersecting window.
+    """
+    if ba is None or bb is None:
+        return 0.0
+    x0 = max(ba[0], bb[0]); y0 = max(ba[1], bb[1])
+    x1 = min(ba[2], bb[2]); y1 = min(ba[3], bb[3])
+    if x0 >= x1 or y0 >= y1:
+        return 0.0
+    sa = a[y0:y1, x0:x1].astype(bool)
+    sb = b[y0:y1, x0:x1].astype(bool)
+    inter = int(np.logical_and(sa, sb).sum())
+    if inter == 0:
+        return 0.0
+    area_a = int(a.sum()); area_b = int(b.sum())
+    union = area_a + area_b - inter
+    return inter / union if union else 0.0
+
+
 def filter_oysters(masks, min_area=4000, max_area=45000, min_solidity=0.85,
                    min_extent=0.60, aspect_range=(1.05, 3.2), roi=None,
                    nms_iou=0.30):
@@ -157,6 +192,108 @@ def filter_oysters(masks, min_area=4000, max_area=45000, min_solidity=0.85,
         if all(_mask_iou(masks[i], masks[j]) < nms_iou for j in final):
             final.append(i)
     return final
+
+
+# --------------------------------------------------------------------------- #
+# Scale-free adaptive filtering
+# --------------------------------------------------------------------------- #
+def _mask_texture(lap, m):
+    v = lap[m > 0]
+    return float(np.mean(np.abs(v))) if v.size else 0.0
+
+
+def _mask_saturation(hsv, m):
+    v = hsv[:, :, 1][m > 0]
+    return float(np.mean(v)) if v.size else 0.0
+
+
+def filter_oysters_adaptive(image_bgr, masks, min_solidity=0.85, min_extent=0.60,
+                            aspect_range=(1.05, 3.2), area_lo=0.20, area_hi=5.0,
+                            tex_pct=0, max_mean_sat=80.0, nms_iou=0.30,
+                            min_abs_area=300, roi=None, return_info=False):
+    """Filter masks to oysters without any absolute pixel-size assumption.
+
+    ``filter_oysters`` gates on absolute pixel area (``min_area``/``max_area``),
+    which silently encodes one camera height. This variant instead:
+
+    * keeps the scale-free shape gates (solidity / extent / aspect);
+    * offers a **texture gate** (``tex_pct``), off by default. It is a
+      percentile, so any non-zero value discards that fraction of candidates
+      whether or not they are spurious; on the reference image tex_pct=35 cost
+      11 real oysters (75 -> 64) while gaining nothing, so it is opt-in only;
+    * adds a **saturation gate** - oyster shells are near-neutral grey/brown/
+      white, while the false positives are vividly coloured (yellow crates,
+      blue clipboards, green tarp, yellow ear tags). Measured on the reference
+      image real oysters have median mean-S 57 and 93%% fall below 80, whereas
+      on a crate photo the spurious tray masks have median 115 and only 5%%
+      fall below 80;
+    * derives the size band from the **population median** of the surviving
+      masks, so it adapts to whatever scale the photo was taken at.
+
+    Defaults were chosen by sweeping against the reference image: it counts 75
+    of 84 here, versus 80 for the original absolute-area filter. That ~5-oyster
+    deficit is the cost of dropping the fitted constants, paid on the one image
+    those constants were fitted to.
+
+    **Known limitation.** This cannot rescue photos where the segmenter never
+    proposes the oysters. On yellow-crate photos FastSAM segments the tray
+    lattice rather than the shells, and raising ``imgsz`` to 1536 or 2048 does
+    not help (counts plateau near 10 against ~90 visible oysters). Those need a
+    trained detector, not better filtering.
+
+    Returns indices into ``masks`` (largest first), or ``(indices, info)``
+    when ``return_info`` is set.
+    """
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    lap = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+
+    props = [shape_props(m) for m in masks]
+    stage1 = []
+    for i, p in enumerate(props):
+        if p is None or p["area"] < min_abs_area:
+            continue
+        if p["solidity"] < min_solidity or p["extent"] < min_extent:
+            continue
+        if not (aspect_range[0] < p["aspect"] < aspect_range[1]):
+            continue
+        if roi is not None:
+            x0, y0, x1, y1 = roi
+            if not (x0 <= p["cx"] <= x1 and y0 <= p["cy"] <= y1):
+                continue
+        stage1.append(i)
+
+    info = {"n_masks": len(masks), "shape": len(stage1), "colour": 0,
+            "texture": 0, "area": 0, "final": 0, "median_area": 0.0}
+    if not stage1:
+        return ([], info) if return_info else []
+
+    stage1c = [i for i in stage1
+               if _mask_saturation(hsv, masks[i]) <= max_mean_sat]
+    info["colour"] = len(stage1c)
+
+    tex = {i: _mask_texture(lap, masks[i]) for i in stage1c}
+    if not tex:
+        return ([], info) if return_info else []
+    tthr = float(np.percentile(list(tex.values()), tex_pct))
+    stage2 = [i for i in stage1c if tex[i] >= tthr]
+    info["texture"] = len(stage2)
+
+    areas = np.array([props[i]["area"] for i in stage2], float)
+    med = float(np.median(areas))
+    stage3 = [i for i in stage2 if area_lo * med <= props[i]["area"] <= area_hi * med]
+    info["area"] = len(stage3)
+    info["median_area"] = med
+
+    stage3.sort(key=lambda i: -props[i]["area"])
+    boxes = {i: _bbox(masks[i]) for i in stage3}
+    final = []
+    for i in stage3:
+        if all(_mask_iou_fast(masks[i], masks[j], boxes[i], boxes[j]) < nms_iou
+               for j in final):
+            final.append(i)
+    info["final"] = len(final)
+    return (final, info) if return_info else final
 
 
 # --------------------------------------------------------------------------- #
