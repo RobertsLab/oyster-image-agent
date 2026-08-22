@@ -1,0 +1,8 @@
+# Oyster vision pipeline
+numpy
+pandas
+opencv-python-headless
+ultralytics>=8.3          # FastSAM segmentation
+tifffile                  # read ImageJ TIFF metadata
+roifile                   # parse ImageJ ROI overlays
+openpyxl                  # read the measurement .xlsx

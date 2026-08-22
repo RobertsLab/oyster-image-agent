@@ -1,0 +1,26 @@
+{
+  "detection": {
+    "n_detected": 80,
+    "n_truth": 84,
+    "TP": 72,
+    "FP": 8,
+    "FN": 12,
+    "precision": 0.9,
+    "recall": 0.857,
+    "f1": 0.878
+  },
+  "length_mm": {
+    "corr": 0.82,
+    "MAE_mm": 4.56,
+    "bias_mm": -0.97,
+    "RMSE_mm": 7.08,
+    "MAPE_pct": 4.79
+  },
+  "width_mm": {
+    "corr": 0.73,
+    "MAE_mm": 4.74,
+    "bias_mm": 2.38,
+    "RMSE_mm": 6.18,
+    "MAPE_pct": 7.94
+  }
+}
